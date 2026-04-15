@@ -872,6 +872,7 @@ def run_doctor() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mine")
+    parser.add_argument("--session", "-s", default="", help="Optional session suffix for state separation")
     parser.add_argument(
         "command",
         choices=(
@@ -1041,8 +1042,8 @@ def run_agent_start(dataset_arg: str = "") -> str:
                 "session": existing,
             },
         }, ensure_ascii=False, indent=2)
-    if existing:
-        store.clear_background_session()
+    # if existing:
+    #     store.clear_background_session()
 
     try:
         worker = build_worker_from_env(auto_register_awp=True)
@@ -1863,6 +1864,12 @@ def run_validator_doctor() -> str:
 
 def main() -> int:
     namespace = build_parser().parse_args()
+
+    if getattr(namespace, "session", ""):
+        suffix = f"-{namespace.session}"
+        out_root = str(_project_root() / "output" / f"agent-runs{suffix}")
+        os.environ["CRAWLER_OUTPUT_ROOT"] = out_root
+        os.environ["WORKER_STATE_ROOT"] = str(Path(out_root) / "_worker_state")
 
     # Handle setup commands first (don't need full imports)
     if namespace.command == "setup":
