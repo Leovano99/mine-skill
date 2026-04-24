@@ -54,11 +54,17 @@ class WSMessage:
 
 class ValidatorWSClient:
     """
-    Manages WebSocket connection to the platform for receiving evaluation tasks.
+    Manages WebSocket connection to the platform for receiving tasks.
 
     Protocol:
-      Server -> Client: {"type": "evaluation_task", "data": {task_id, assignment_id, submission_id, mode}}
-      Client -> Server: {"ack_eval": "<assignment_id>"}  (must be sent within 30s)
+      Server -> Client: {"type": "evaluation_task", "data": {"task_id": "evt_xxx"}}
+      Server -> Client: {"type": "repeat_crawl_task", "data": {...full task...}}
+      Server -> Client: {"type": "error", "code": "...", "message": "...", "retry_after_seconds": N}
+      Client -> Server: {"ack": "<task_id>"}          (repeat crawl task ACK, triggers claim)
+      Client -> Server: {"reject": "<task_id>"}       (reject repeat crawl task)
+
+    Evaluation flow: WS notify (task_id only) → HTTP POST /evaluation-tasks/claim
+    (gets assignment_id + full data) → evaluate → HTTP POST /evaluation-tasks/{id}/report
 
     Reconnection:
       Uses exponential backoff: 1s -> 2s -> 4s -> ... -> 60s max.
@@ -133,10 +139,10 @@ class ValidatorWSClient:
             except Exception:
                 pass
 
-    def send_ack_eval(self, assignment_id: str) -> None:
-        """Send evaluation task acknowledgment. Must be called within 30s of receiving task."""
-        self._send({"ack_eval": assignment_id})
-        log.info("Sent ack_eval for assignment %s", assignment_id)
+    def send_ack_eval(self, task_id: str) -> None:
+        """Send evaluation task ACK (triggers claim). Must be within 30s."""
+        self._send({"ack_eval": task_id})
+        log.info("Sent ack_eval for task %s", task_id)
 
     def send_ack_repeat_crawl(self, task_id: str) -> None:
         """Acknowledge repeat crawl task, starts 5-min lease."""

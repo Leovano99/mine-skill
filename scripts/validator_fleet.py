@@ -342,6 +342,10 @@ class ValidatorInstance:
             if isinstance(claim, dict) and claim.get("_cooldown"):
                 self._stop_event.wait(timeout=int(claim.get("retry_after_seconds", 30)))
                 return
+            if isinstance(claim, dict) and claim.get("_pow_required"):
+                self.log.warning("PoW challenge received — fleet uses random scoring, cannot solve. Waiting.")
+                self._stop_event.wait(timeout=60)
+                return
             msg = WSMessage({"type": "evaluation_task", "data": claim})
             self._handle_task(msg, via_http=True)
         except Exception as exc:
@@ -351,39 +355,44 @@ class ValidatorInstance:
     # ── 评估处理 ──
 
     def _handle_task(self, msg: WSMessage, *, via_http: bool = False) -> None:
-        assignment_id = msg.assignment_id
         task_id = msg.task_id
-
         self._inc_stat("tasks_received")
 
-        # ACK
-        if not via_http:
+        # HTTP POST /evaluation-tasks/claim → get assignment_id + full data
+        if via_http:
+            claim_data = msg.data
+        else:
             try:
-                self._ws.send_ack_eval(assignment_id)
+                with self._platform_lock:
+                    claim_data = self._platform.claim_evaluation_task()
+                if not claim_data:
+                    return
+                if claim_data.get("_cooldown"):
+                    retry = int(claim_data.get("retry_after_seconds", 30))
+                    self.log.info("Cooldown on WS claim: %ds", retry)
+                    self._stop_event.wait(timeout=retry)
+                    return
+                if claim_data.get("_pow_required"):
+                    self.log.warning("PoW challenge on WS claim — fleet cannot solve, waiting 60s")
+                    self._stop_event.wait(timeout=60)
+                    return
             except Exception as exc:
-                self.log.warning("ACK failed: %s", exc)
+                self.log.warning("Claim failed: %s", exc)
                 self._inc_stat("errors")
                 return
 
-        # 提取数据
-        claim_data = msg.data
-        cleaned_data = str(claim_data.get("cleaned_data") or "")
-        structured_data = claim_data.get("structured_data") or {}
-        schema_fields = claim_data.get("schema_fields") or []
+        assignment_id = str(claim_data.get("assignment_id") or "")
+        task_id = str(claim_data.get("task_id") or task_id)
+        if not assignment_id:
+            self.log.warning("No assignment_id from claim for %s", task_id)
+            return
 
-        # 如果 claim payload 不完整，HTTP fallback 获取
-        if not cleaned_data or not structured_data:
-            try:
-                detail = self._platform.get_evaluation_task(task_id)
-                cleaned_data = cleaned_data or str(detail.get("cleaned_data") or "")
-                structured_data = structured_data or detail.get("structured_data") or {}
-                if not schema_fields:
-                    schema_fields = detail.get("schema_fields") or []
-            except Exception as exc:
-                self.log.warning("Fetch task %s failed: %s", task_id, exc)
-
-        # 随机评分（不调 LLM）
-        result = self._engine.evaluate(cleaned_data, structured_data, schema_fields)
+        # 随机评分
+        result = self._engine.evaluate(
+            str(claim_data.get("cleaned_data") or ""),
+            claim_data.get("structured_data") or {},
+            claim_data.get("schema_fields") or [],
+        )
         self._inc_stat("tasks_evaluated")
 
         # 上报

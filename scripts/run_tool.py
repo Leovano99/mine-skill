@@ -2140,6 +2140,22 @@ def main() -> int:
 
             store.update_session(status="stopped")
             print(json.dumps(runtime.status(), ensure_ascii=False, indent=2))
+
+            # Auto-update re-exec: if the validator stopped due to auto_update,
+            # re-exec the same command so it picks up the new code immediately.
+            last_action = ""
+            try:
+                for action in runtime._recent_actions[-5:]:
+                    if isinstance(action, dict) and action.get("action") == "auto_update_applied":
+                        last_action = "auto_update"
+                        break
+            except Exception:
+                pass
+            if last_action == "auto_update":
+                import logging
+                logging.getLogger("validator.worker").info("Auto-update: re-exec with new code")
+                os.execv(sys.executable, [sys.executable, "-u", __file__] + sys.argv[1:])
+
         except Exception as exc:
             store.update_session(status="error", error=str(exc))
             print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
@@ -2274,13 +2290,18 @@ def main() -> int:
             max_iter = int(namespace.args[1]) if len(namespace.args) > 1 else 1
         except ValueError:
             raise SystemExit("run-worker: expected integer arguments for interval and max_iterations")
-        # Configure logging so background-worker INFO-level messages actually
-        # reach the log file. Without this the default Python logger only
-        # emits WARNING+ to stderr, and every log.info("heartbeat ok") /
-        # log.info("discovery iteration") call is silently dropped —
-        # producing a 0-byte log file that looks like a hung worker.
         _configure_background_logging()
-        print(json.dumps(worker.run_worker(interval=interval, max_iterations=max_iter), ensure_ascii=False, indent=2))
+        result = worker.run_worker(interval=interval, max_iterations=max_iter)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        # Auto-update re-exec: if the worker stopped due to auto_update,
+        # re-exec the same command so it picks up the new code immediately.
+        # This avoids requiring an external supervisor to restart the worker.
+        stop_reason = str(result.get("status", {}).get("stop_reason") or
+                         worker.state_store.load_session().get("stop_reason") or "")
+        if stop_reason == "auto_update":
+            import logging
+            logging.getLogger("agent.worker").info("Auto-update: re-exec with new code")
+            os.execv(sys.executable, [sys.executable, "-u", __file__] + sys.argv[1:])
         return 0
 
     if namespace.command == "process-task-file":

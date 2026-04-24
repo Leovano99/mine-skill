@@ -230,7 +230,9 @@ class PlatformClient:
     def _claim(self, path: str) -> dict[str, Any] | None:
         """POST a claim request. Returns task data, None (no task), or a
         cooldown sentinel ``{"_cooldown": True, "retry_after_seconds": N}``
-        when the platform returns 409 ``validator_cooldown``.
+        when the platform returns 409 ``validator_cooldown``,
+        or a PoW sentinel ``{"_pow_required": True, ...}``
+        when the platform returns 428 ``pow_required``.
         """
         try:
             payload = self._request("POST", path, {})
@@ -240,6 +242,8 @@ class PlatformClient:
             if api_err.status_code == 409:
                 body = api_err.response if isinstance(api_err.response, dict) else {}
                 return self._parse_cooldown(body)
+            # 428 with success:true never reaches PlatformApiError (raise_for_status
+            # fires first → httpx.HTTPStatusError). Handled below.
             raise
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 404:
@@ -250,6 +254,15 @@ class PlatformClient:
                 except ValueError:
                     return None
                 return self._parse_cooldown(body)
+            if error.response.status_code == 428:
+                try:
+                    body = error.response.json()
+                except ValueError:
+                    return None
+                data = body.get("data") if isinstance(body, dict) else {}
+                if isinstance(data, dict) and data.get("pow_required"):
+                    return {"_pow_required": True, **data}
+                return None
             raise
         data = payload.get("data")
         if data in (None, {}, []):
@@ -428,7 +441,7 @@ class PlatformClient:
                 # says retryable=true — it means "retry after cooldown", not
                 # "retry immediately". Callers (e.g. _claim) handle 409 by
                 # parsing retry_after_seconds from the response.
-                if (status_code >= 500 or status_code == 429 or (error_retryable and status_code != 409)) and attempt < max_attempts:
+                if (status_code >= 500 or status_code == 429 or (error_retryable and status_code not in (409, 428))) and attempt < max_attempts:
                     if status_code == 429:
                         # Respect Retry-After header or use longer backoff for rate limits
                         retry_after = error.response.headers.get("Retry-After")

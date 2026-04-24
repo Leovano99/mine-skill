@@ -153,13 +153,18 @@ class ValidatorRuntime:
             "recent_actions": self._recent_actions[-30:],
             "min_task_interval": min_interval,
         }
+        tmp = str(self._status_file) + f".tmp-{os.getpid()}-{threading.get_ident()}"
         try:
-            tmp = str(self._status_file) + ".tmp"
+            self._status_file.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "w") as f:
                 json.dump(status, f, indent=2)
             os.replace(tmp, str(self._status_file))
         except OSError as e:
             log.warning("Failed to write status file: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _restore_stats(self) -> None:
         """Restore stats from previous run so counters survive restarts."""
@@ -586,56 +591,103 @@ class ValidatorRuntime:
             paused = self._paused
         if not eligible or paused:
             return
-        try:
-            with self._platform_lock:
-                claim_data = self._platform.claim_evaluation_task()
-            if not claim_data:
-                return
-            # Handle 409 validator_cooldown sentinel from _claim
-            if isinstance(claim_data, dict) and claim_data.get("_cooldown"):
-                retry_after = int(claim_data.get("retry_after_seconds", 30))
-                log.info("Validator cooldown via HTTP: sleeping %ds", retry_after)
-                self._stop_event.wait(timeout=retry_after)
-                return
-            msg = WSMessage({"type": "evaluation_task", "data": claim_data})
-            self._inc_stat("tasks_received")
+        # Iterative claim loop with PoW retry (max 3 attempts to avoid infinite loop)
+        for _attempt in range(3):
             try:
-                self._handle_evaluation_task(msg, via_http=True)
-            except Exception as eval_exc:
-                self._inc_stat("errors")
-                self._inc_stat("consecutive_failures")
-                log.error("HTTP fallback eval failed: %s", eval_exc)
-                self._write_status()
-        except Exception as exc:
-            error_str = str(exc)
-            if "404" not in error_str and "409" not in error_str:
-                log.warning("HTTP poll claim failed: %s", exc)
+                with self._platform_lock:
+                    claim_data = self._platform.claim_evaluation_task()
+                if not claim_data:
+                    return
+                if isinstance(claim_data, dict) and claim_data.get("_cooldown"):
+                    retry_after = int(claim_data.get("retry_after_seconds", 30))
+                    log.info("Validator cooldown via HTTP: sleeping %ds", retry_after)
+                    self._stop_event.wait(timeout=retry_after)
+                    return
+                if isinstance(claim_data, dict) and claim_data.get("_pow_required"):
+                    if self._handle_pow_challenge(claim_data):
+                        log.info("PoW passed — retrying claim")
+                        continue  # retry claim in next loop iteration
+                    return  # PoW failed — next claim will return 409 cooldown
+                # Normal claim success
+                msg = WSMessage({"type": "evaluation_task", "data": claim_data})
+                self._inc_stat("tasks_received")
+                try:
+                    self._handle_evaluation_task(msg, via_http=True)
+                except Exception as eval_exc:
+                    self._inc_stat("errors")
+                    self._inc_stat("consecutive_failures")
+                    log.error("HTTP fallback eval failed: %s", eval_exc)
+                    self._write_status()
+                return
+            except Exception as exc:
+                error_str = str(exc)
+                if "404" not in error_str and "409" not in error_str:
+                    log.warning("HTTP poll claim failed: %s", exc)
+                return
+        log.warning("HTTP poll: PoW retry limit reached (3 attempts) without claiming a task")
 
     def _handle_evaluation_task(self, msg: WSMessage, *, via_http: bool = False) -> None:
-        """Process a single evaluation task assignment.
+        """Process a single evaluation task.
 
-        WS flow (推荐):
-          1. WS 推送 evaluation_task 通知 (只有 task_id + assignment_id)
-          2. WS ack_eval → 服务端 claim (占位，不返回数据)
-          3. HTTP POST /evaluation-tasks/claim → 获取完整数据
-          4. 评估 + HTTP report
+        Per API spec, the complete flow is:
+          1. WS push: {"type":"evaluation_task","data":{"task_id":"evt_xxx"}} (task_id only)
+          2. HTTP POST /evaluation-tasks/claim → returns assignment_id + full data
+          3. Evaluate
+          4. HTTP POST /evaluation-tasks/{id}/report with assignment_id
 
-        HTTP polling flow:
-          1. HTTP POST /evaluation-tasks/claim → 直接返回完整数据
-          2. 评估 + HTTP report
+        The assignment_id comes from the claim response, NOT from WS push.
+        WS ack_eval is no longer required — claim via HTTP is sufficient.
+
+        HTTP polling flow (WS unavailable):
+          1. HTTP POST /evaluation-tasks/claim → directly returns full data
+          2. Evaluate + report
         """
-        assignment_id = msg.assignment_id
         task_id = msg.task_id
 
-        # Step 1: ACK via WS (占位) or skip (HTTP claim already includes claim)
-        if not via_http:
-            self._ws.send_ack_eval(assignment_id)
-        log.info("Task claimed: assignment=%s task=%s http=%s", assignment_id, task_id, via_http)
+        # HTTP POST /evaluation-tasks/claim to get assignment_id + full data.
+        # WS push only carries task_id. The claim response is the authoritative
+        # source for assignment_id (REQUIRED in report) and all evaluation data.
+        if via_http:
+            # HTTP polling path — msg.data already contains full claim response
+            claim_data = msg.data
+        else:
+            # WS path — must call HTTP claim to get assignment_id + data
+            try:
+                with self._platform_lock:
+                    claim_data = self._platform.claim_evaluation_task()
+                if not claim_data:
+                    log.warning("Claim returned no data for task %s", task_id)
+                    return
+                if claim_data.get("_cooldown"):
+                    retry_after = int(claim_data.get("retry_after_seconds", 30))
+                    log.info("Validator cooldown on WS claim: sleeping %ds", retry_after)
+                    self._stop_event.wait(timeout=retry_after)
+                    return
+                # 428 PoW required — solve and retry claim
+                if claim_data.get("_pow_required"):
+                    if self._handle_pow_challenge(claim_data):
+                        log.info("PoW passed — retrying claim for task %s", task_id)
+                        with self._platform_lock:
+                            claim_data = self._platform.claim_evaluation_task()
+                        if not claim_data:
+                            log.info("No task available after PoW pass")
+                            return
+                        if claim_data.get("_cooldown"):
+                            retry = int(claim_data.get("retry_after_seconds", 30))
+                            log.info("Cooldown after PoW retry: %ds", retry)
+                            self._stop_event.wait(timeout=retry)
+                            return
+                        if claim_data.get("_pow_required"):
+                            log.warning("Second PoW challenge on retry — dropping")
+                            return
+                    else:
+                        return
+            except Exception as exc:
+                log.warning("HTTP claim for task %s failed: %s", task_id, exc)
+                return
 
-        # Step 2: Get full evaluation data via HTTP.
-        # WS 通知只携带 task_id + assignment_id，不包含完整数据。
-        # HTTP claim/get_evaluation_task 才返回 cleaned_data, structured_data 等。
-        claim_data = msg.data
+        assignment_id = str(claim_data.get("assignment_id") or "")
+        task_id = str(claim_data.get("task_id") or task_id)
         dataset_id = str(claim_data.get("dataset_id") or "")
         cleaned_data = str(claim_data.get("cleaned_data") or "")
         repeat_cleaned_data = str(claim_data.get("repeat_cleaned_data") or "")
@@ -643,23 +695,11 @@ class ValidatorRuntime:
         schema_fields = claim_data.get("schema_fields") or []
         dataset_schema = claim_data.get("dataset_schema") or {}
 
-        # WS 通知通常不含完整数据——必须通过 HTTP 获取
-        if not cleaned_data or not structured_data:
-            try:
-                with self._platform_lock:
-                    task_detail = self._platform.get_evaluation_task(task_id)
-                if isinstance(task_detail, dict):
-                    cleaned_data = cleaned_data or str(task_detail.get("cleaned_data") or "")
-                    repeat_cleaned_data = repeat_cleaned_data or str(task_detail.get("repeat_cleaned_data") or "")
-                    structured_data = structured_data or task_detail.get("structured_data") or {}
-                    if not schema_fields:
-                        schema_fields = task_detail.get("schema_fields") or []
-                    if not dataset_schema:
-                        dataset_schema = task_detail.get("dataset_schema") or {}
-                    if not dataset_id:
-                        dataset_id = str(task_detail.get("dataset_id") or "")
-            except Exception as exc:
-                log.warning("HTTP fetch for task %s failed: %s", task_id, exc)
+        if not assignment_id:
+            log.warning("No assignment_id from claim for task %s — cannot report", task_id)
+            return
+
+        log.info("Task claimed: task=%s assignment=%s dataset=%s", task_id, assignment_id, dataset_id)
 
         if not isinstance(structured_data, dict):
             structured_data = {}
@@ -724,6 +764,108 @@ class ValidatorRuntime:
             log.info("Waiting %ds (min_task_interval) before next task", wait_seconds)
             self._set_phase("cooldown", f"{wait_seconds}s (min_task_interval)")
             self._stop_event.wait(timeout=wait_seconds)
+
+    # ------------------------------------------------------------------
+    # PoW (Proof of Work) challenge handling
+    # ------------------------------------------------------------------
+
+    def _handle_pow_challenge(self, pow_data: dict[str, Any]) -> bool:
+        """Handle a 428 PoW challenge. Returns True if passed.
+
+        Per doc: after passing, caller should retry claim immediately.
+        After failing, next claim returns 409 cooldown (handled upstream).
+        """
+        challenge = pow_data.get("challenge") or {}
+        challenge_id = str(challenge.get("id") or pow_data.get("challenge_id") or "")
+        prompt = str(challenge.get("prompt") or "")
+
+        if not challenge_id or not prompt:
+            log.warning("PoW challenge missing id or prompt: %s", pow_data)
+            return False
+
+        log.info("PoW challenge: id=%s type=%s", challenge_id, challenge.get("question_type"))
+        self._record_action("pow_challenge", {"challenge_id": challenge_id})
+        self._set_phase("solving_pow", f"challenge {challenge_id}")
+
+        answer = self._solve_logic_puzzle(prompt)
+        if not answer:
+            log.warning("Failed to solve PoW puzzle")
+            self._record_action("pow_failed", {"challenge_id": challenge_id, "reason": "no_answer"})
+            self._set_phase("waiting_for_task")
+            return False
+
+        log.info("Submitting PoW answer: %s", answer)
+        try:
+            with self._platform_lock:
+                result = self._platform.answer_pow_challenge(challenge_id, answer)
+            data = result.get("data") if isinstance(result, dict) else {}
+            passed = data.get("passed", False) if isinstance(data, dict) else False
+
+            if passed:
+                log.info("PoW challenge passed!")
+                self._record_action("pow_passed", {"challenge_id": challenge_id})
+                self._set_phase("waiting_for_task")
+                return True
+            else:
+                log.warning("PoW challenge failed (wrong answer)")
+                self._record_action("pow_failed", {"challenge_id": challenge_id, "reason": "wrong_answer"})
+                self._inc_stat("errors")
+                self._set_phase("waiting_for_task")
+                return False
+        except Exception as exc:
+            log.error("PoW answer submit failed: %s", exc)
+            self._record_action("pow_error", {"challenge_id": challenge_id, "error": str(exc)})
+            self._inc_stat("errors")
+            self._set_phase("waiting_for_task")
+            return False
+
+    def _solve_logic_puzzle(self, prompt: str) -> str:
+        """Use the LLM to solve a logic grid puzzle.
+
+        Calls enrich_with_llm directly (not via self._engine.llm_call) so the
+        system_prompt is passed as a separate role — important for models that
+        distinguish system vs user turns.
+
+        Returns ONLY the answer value (e.g. "bird", "coffee", "red").
+        """
+        import asyncio
+        try:
+            from crawler.enrich.generative.llm_enrich import enrich_with_llm
+
+            system_prompt = (
+                "You are solving a logic puzzle. Read the clues carefully, "
+                "use elimination to deduce the answer. "
+                "Respond with ONLY the answer value (a single word), nothing else. "
+                "No explanation, no punctuation."
+            )
+
+            async def _run() -> str:
+                result = await enrich_with_llm(
+                    prompt,
+                    model_config=getattr(self._engine, "model_config", None),
+                    system_prompt=system_prompt,
+                    timeout=60.0,
+                )
+                if not result.success:
+                    raise RuntimeError(result.error or "LLM call failed")
+                return result.content
+
+            from evaluation_engine import _LLM_EXECUTOR
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    raw = _LLM_EXECUTOR.submit(lambda: asyncio.run(_run())).result()
+                else:
+                    raw = asyncio.run(_run())
+            except RuntimeError:
+                raw = asyncio.run(_run())
+
+            if raw:
+                raw = raw.strip().split("\n")[0].strip().strip(".").strip('"').strip("'").lower()
+            return raw or ""
+        except Exception as exc:
+            log.error("LLM solve failed: %s", exc)
+            return ""
 
     def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the platform.

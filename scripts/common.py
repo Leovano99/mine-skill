@@ -863,9 +863,9 @@ DEFAULT_VALIDATOR_ID = "validator-agent"
 DEFAULT_EVAL_TIMEOUT = 120
 
 CREDIT_TIER_INTERVALS = {
-    "novice": 600,
-    "restricted": 300,
-    "normal": 120,
+    "probation": 600,
+    "low": 300,
+    "moderate": 120,
     "good": 30,
     "excellent": 10,
 }
