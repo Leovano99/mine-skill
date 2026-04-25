@@ -11,4 +11,4 @@ $PYTHON $SCRIPT --session instance3 agent-start ds_wikipedia &
 
 wait
 
-echo "All agents started.
+echo "All agents started."
